@@ -1,7 +1,7 @@
 <?php
 /**
- * Plugin Name: site settings
- * Description: By Avinash. Lightweight personal utility plugin for SMTP, scripts, custom functions, and database maintenance.
+ * Plugin Name: Site Settings
+ * Description: Lightweight personal utility plugin for SMTP, scripts, custom functions, and database maintenance.
  * Version: 1.0.0
  * Author: Avinash
  * Requires at least: 6.0
@@ -39,6 +39,19 @@ final class Avinash_Site_Settings {
 		add_action( 'wp_head', array( $this, 'print_header_scripts' ), 99 );
 		add_action( 'wp_footer', array( $this, 'print_footer_scripts' ), 99 );
 		add_action( 'plugins_loaded', array( $this, 'load_custom_functions' ), 20 );
+		add_filter( 'plugin_action_links_' . plugin_basename( __FILE__ ), array( $this, 'add_plugin_action_links' ) );
+	}
+
+	public function add_plugin_action_links( array $links ): array {
+		$settings_link = sprintf(
+			'<a href="%s">%s</a>',
+			esc_url( add_query_arg( array( 'page' => self::PAGE_SLUG ), admin_url( 'admin.php' ) ) ),
+			esc_html__( 'Settings', 'site-settings-by-avinash' )
+		);
+
+		array_unshift( $links, $settings_link );
+
+		return $links;
 	}
 
 	public function register_menu(): void {
@@ -106,6 +119,18 @@ final class Avinash_Site_Settings {
 				$this->delete_post_revisions();
 				$tab = 'database';
 				break;
+			case 'delete_unapproved_comments':
+				$this->delete_unapproved_comments();
+				$tab = 'database';
+				break;
+			case 'delete_expired_transients':
+				$this->delete_expired_transients();
+				$tab = 'database';
+				break;
+			case 'optimize_table':
+				$this->optimize_database_table();
+				$tab = 'database';
+				break;
 		}
 
 		wp_safe_redirect(
@@ -149,7 +174,7 @@ final class Avinash_Site_Settings {
 		}
 
 		if ( 'functions' === $tab ) {
-			$options['custom_functions'] = (string) ( $posted['custom_functions'] ?? '' );
+			$options['custom_functions'] = $this->sanitize_custom_functions( $posted['custom_functions'] ?? array() );
 		}
 
 		update_option( self::OPTION_NAME, $options, false );
@@ -230,6 +255,89 @@ final class Avinash_Site_Settings {
 		);
 	}
 
+	private function delete_unapproved_comments(): void {
+		$deleted = 0;
+
+		do {
+			$batch_deleted = 0;
+			$comment_ids = get_comments(
+				array(
+					'status' => 'hold',
+					'fields' => 'ids',
+					'number' => 200,
+				)
+			);
+
+			foreach ( $comment_ids as $comment_id ) {
+				if ( wp_delete_comment( (int) $comment_id, true ) ) {
+					++$deleted;
+					++$batch_deleted;
+				}
+			}
+		} while ( 200 === count( $comment_ids ) && $batch_deleted > 0 );
+
+		$this->set_notice(
+			sprintf(
+				/* translators: %d: Number of deleted comments. */
+				_n( '%d unapproved comment deleted.', '%d unapproved comments deleted.', $deleted, 'site-settings-by-avinash' ),
+				$deleted
+			),
+			'success'
+		);
+	}
+
+	private function delete_expired_transients(): void {
+		$expired = $this->get_expired_transient_timeout_names();
+
+		foreach ( $expired as $timeout_name ) {
+			$transient_name = str_replace(
+				array( '_transient_timeout_', '_site_transient_timeout_' ),
+				array( '_transient_', '_site_transient_' ),
+				$timeout_name
+			);
+
+			delete_option( $transient_name );
+			delete_option( $timeout_name );
+		}
+
+		$this->set_notice(
+			sprintf(
+				/* translators: %d: Number of expired transients. */
+				_n( '%d expired transient removed.', '%d expired transients removed.', count( $expired ), 'site-settings-by-avinash' ),
+				count( $expired )
+			),
+			'success'
+		);
+	}
+
+	private function optimize_database_table(): void {
+		global $wpdb;
+
+		$table_name = isset( $_POST['avinash_table_name'] ) ? sanitize_text_field( wp_unslash( $_POST['avinash_table_name'] ) ) : '';
+
+		if ( '' === $table_name || ! $this->database_table_exists( $table_name ) ) {
+			$this->set_notice( __( 'Select a valid database table to optimize.', 'site-settings-by-avinash' ), 'error' );
+			return;
+		}
+
+		$escaped_table = '`' . str_replace( '`', '``', $table_name ) . '`';
+		$result        = $wpdb->query( "OPTIMIZE TABLE {$escaped_table}" ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+
+		if ( false === $result ) {
+			$this->set_notice( __( 'Table optimization failed. Check database permissions.', 'site-settings-by-avinash' ), 'error' );
+			return;
+		}
+
+		$this->set_notice(
+			sprintf(
+				/* translators: %s: Database table name. */
+				__( '%s optimized successfully.', 'site-settings-by-avinash' ),
+				$table_name
+			),
+			'success'
+		);
+	}
+
 	public function configure_phpmailer( $phpmailer ): void {
 		$options = $this->get_options();
 
@@ -276,18 +384,32 @@ final class Avinash_Site_Settings {
 
 	public function load_custom_functions(): void {
 		$options = $this->get_options();
-		$code    = trim( $options['custom_functions'] );
+		$snippets = $options['custom_functions'];
+		$errors   = array();
 
-		if ( '' === $code ) {
+		foreach ( $snippets as $snippet ) {
+			if ( empty( $snippet['enabled'] ) || '' === trim( $snippet['code'] ) ) {
+				continue;
+			}
+
+			try {
+				eval( $this->normalize_php_code( $snippet['code'] ) ); // phpcs:ignore Squiz.PHP.Eval.Discouraged
+			} catch ( Throwable $throwable ) {
+				$errors[] = sprintf(
+					/* translators: 1: Snippet title, 2: PHP error message. */
+					__( '%1$s: %2$s', 'site-settings-by-avinash' ),
+					$snippet['title'],
+					$throwable->getMessage()
+				);
+			}
+		}
+
+		if ( empty( $errors ) ) {
+			delete_transient( 'avinash_site_settings_php_error' );
 			return;
 		}
 
-		try {
-			eval( $this->normalize_php_code( $code ) ); // phpcs:ignore Squiz.PHP.Eval.Discouraged
-			delete_transient( 'avinash_site_settings_php_error' );
-		} catch ( Throwable $throwable ) {
-			set_transient( 'avinash_site_settings_php_error', $throwable->getMessage(), HOUR_IN_SECONDS );
-		}
+		set_transient( 'avinash_site_settings_php_error', implode( ' | ', $errors ), HOUR_IN_SECONDS );
 	}
 
 	public function render_admin_page(): void {
@@ -300,7 +422,10 @@ final class Avinash_Site_Settings {
 		$notice         = get_transient( self::NOTICE_TRANSIENT );
 		$php_error      = get_transient( 'avinash_site_settings_php_error' );
 		$revision_count = $this->get_revision_count();
+		$comment_count  = 'database' === $active_tab ? $this->get_unapproved_comment_count() : 0;
+		$transients     = 'database' === $active_tab ? $this->get_transient_counts() : array( 'expired' => 0, 'total' => 0 );
 		$db_size        = $this->get_database_size();
+		$db_tables      = 'database' === $active_tab ? $this->get_database_tables() : array();
 
 		if ( false !== $notice ) {
 			delete_transient( self::NOTICE_TRANSIENT );
@@ -375,7 +500,7 @@ final class Avinash_Site_Settings {
 					<?php endif; ?>
 
 					<?php if ( 'database' === $active_tab ) : ?>
-						<?php $this->render_database_tab( $revision_count, $db_size ); ?>
+						<?php $this->render_database_tab( $revision_count, $comment_count, $transients, $db_size, $db_tables ); ?>
 					<?php endif; ?>
 				</main>
 			</div>
@@ -518,32 +643,92 @@ final class Avinash_Site_Settings {
 	}
 
 	private function render_functions_tab( array $options ): void {
+		$snippets = $options['custom_functions'];
+
+		if ( empty( $snippets ) ) {
+			$snippets[] = array(
+				'title'   => '',
+				'code'    => '',
+				'enabled' => true,
+			);
+		}
 		?>
-		<section class="avinash-editor">
-			<div class="avinash-editor__top">
+		<section class="avinash-panel avinash-functions-panel">
+			<div class="avinash-panel__header">
 				<div>
-					<span class="dashicons dashicons-editor-code"></span>
-					<strong><?php esc_html_e( 'CUSTOM FUNCTIONS (PHP)', 'site-settings-by-avinash' ); ?></strong>
+					<h2><?php esc_html_e( 'Custom Functions', 'site-settings-by-avinash' ); ?></h2>
+					<p><?php esc_html_e( 'Manage PHP snippets individually and load only the enabled ones.', 'site-settings-by-avinash' ); ?></p>
 				</div>
-				<div class="avinash-editor__lights" aria-hidden="true"><span></span><span></span><span></span></div>
+				<button class="avinash-button avinash-button--secondary" type="button" data-avinash-add-function>
+					<span class="dashicons dashicons-plus-alt2"></span>
+					<?php esc_html_e( 'Add Function', 'site-settings-by-avinash' ); ?>
+				</button>
 			</div>
-			<div class="avinash-editor__body">
-				<div class="avinash-editor__lines" aria-hidden="true">
-					<?php for ( $i = 1; $i <= 14; $i++ ) : ?>
-						<span><?php echo esc_html( (string) $i ); ?></span>
-					<?php endfor; ?>
-				</div>
-				<textarea name="avinash_site_settings[custom_functions]" rows="14" spellcheck="false" placeholder="<?php esc_attr_e( "Add custom WordPress functions here. Opening <?php tags are optional.\n\nExample:\nadd_action('wp_head', function () {\n    echo '<!-- Site configured by Site Settings -->';\n});", 'site-settings-by-avinash' ); ?>"><?php echo esc_textarea( $options['custom_functions'] ); ?></textarea>
+
+			<div class="avinash-functions-list" data-avinash-functions-list>
+				<?php foreach ( $snippets as $index => $snippet ) : ?>
+					<?php $this->render_function_snippet( (int) $index, $snippet ); ?>
+				<?php endforeach; ?>
 			</div>
-			<div class="avinash-editor__status">
-				<span><?php esc_html_e( 'PHP snippets load on plugins_loaded', 'site-settings-by-avinash' ); ?></span>
-				<span><?php esc_html_e( 'UTF-8', 'site-settings-by-avinash' ); ?></span>
-			</div>
+
+			<template data-avinash-function-template>
+				<?php
+				$this->render_function_snippet(
+					'__INDEX__',
+					array(
+						'title'   => '',
+						'code'    => '',
+						'enabled' => true,
+					)
+				);
+				?>
+			</template>
 		</section>
 		<?php
 	}
 
-	private function render_database_tab( int $revision_count, string $db_size ): void {
+	private function render_function_snippet( $index, array $snippet ): void {
+		$field_prefix = 'avinash_site_settings[custom_functions][' . $index . ']';
+		$title_id     = 'avinash-function-title-' . $index;
+		$code_id      = 'avinash-function-code-' . $index;
+		?>
+		<article class="avinash-function-item" data-avinash-function-item>
+			<div class="avinash-function-item__header">
+				<div class="avinash-function-title">
+					<label for="<?php echo esc_attr( $title_id ); ?>"><?php esc_html_e( 'Title', 'site-settings-by-avinash' ); ?></label>
+					<input id="<?php echo esc_attr( $title_id ); ?>" name="<?php echo esc_attr( $field_prefix ); ?>[title]" type="text" value="<?php echo esc_attr( $snippet['title'] ); ?>" placeholder="<?php esc_attr_e( 'Function title', 'site-settings-by-avinash' ); ?>">
+				</div>
+				<div class="avinash-function-actions">
+					<label class="avinash-switch">
+						<input type="checkbox" name="<?php echo esc_attr( $field_prefix ); ?>[enabled]" value="1" <?php checked( ! empty( $snippet['enabled'] ) ); ?>>
+						<span></span>
+						<strong><?php esc_html_e( 'Enabled', 'site-settings-by-avinash' ); ?></strong>
+					</label>
+					<button class="avinash-icon-button" type="button" data-avinash-remove-function title="<?php esc_attr_e( 'Remove function', 'site-settings-by-avinash' ); ?>">
+						<span class="dashicons dashicons-trash"></span>
+					</button>
+				</div>
+			</div>
+			<textarea id="<?php echo esc_attr( $code_id ); ?>" name="<?php echo esc_attr( $field_prefix ); ?>[code]" rows="10" spellcheck="false" placeholder="<?php esc_attr_e( "Opening <?php tags are optional.\n\nadd_action('wp_head', function () {\n    echo '<!-- Site configured by Site Settings -->';\n});", 'site-settings-by-avinash' ); ?>"><?php echo esc_textarea( $snippet['code'] ); ?></textarea>
+		</article>
+		<?php
+	}
+
+	private function render_database_tab( int $revision_count, int $comment_count, array $transients, string $db_size, array $tables ): void {
+		$myisam_overhead = 0;
+		$myisam_count    = 0;
+		$innodb_count    = 0;
+
+		foreach ( $tables as $table ) {
+			if ( 'myisam' === strtolower( $table['engine'] ) ) {
+				++$myisam_count;
+				$myisam_overhead += (int) $table['overhead'];
+			}
+
+			if ( 'innodb' === strtolower( $table['engine'] ) ) {
+				++$innodb_count;
+			}
+		}
 		?>
 		<section class="avinash-panel avinash-db-panel">
 			<div class="avinash-db-summary">
@@ -554,12 +739,16 @@ final class Avinash_Site_Settings {
 						<?php esc_html_e( 'Current DB Size:', 'site-settings-by-avinash' ); ?>
 						<strong><?php echo esc_html( $db_size ); ?></strong>
 					</p>
+					<p>
+						<?php esc_html_e( 'MyISAM Overhead:', 'site-settings-by-avinash' ); ?>
+						<strong><?php echo esc_html( size_format( $myisam_overhead, 1 ) ); ?></strong>
+					</p>
 				</div>
 				<form method="post">
 					<?php wp_nonce_field( self::NONCE_ACTION, self::NONCE_NAME ); ?>
 					<input type="hidden" name="avinash_site_settings_action" value="optimize_revisions">
 					<input type="hidden" name="avinash_site_settings_tab" value="database">
-					<button class="avinash-button avinash-button--primary" type="submit"><?php esc_html_e( 'Run Optimization', 'site-settings-by-avinash' ); ?></button>
+					<button class="avinash-button avinash-button--primary" type="submit"><?php esc_html_e( 'Remove Revisions', 'site-settings-by-avinash' ); ?></button>
 				</form>
 			</div>
 			<div class="avinash-db-task">
@@ -582,6 +771,122 @@ final class Avinash_Site_Settings {
 				</label>
 				<strong><?php esc_html_e( 'Recommended', 'site-settings-by-avinash' ); ?></strong>
 			</div>
+			<div class="avinash-db-task">
+				<label>
+					<input type="checkbox" checked disabled>
+					<span>
+						<strong><?php esc_html_e( 'Remove Unapproved Comments', 'site-settings-by-avinash' ); ?></strong>
+						<em>
+							<?php
+							echo esc_html(
+								sprintf(
+									/* translators: %d: Number of unapproved comments. */
+									_n( '%d unapproved comment found.', '%d unapproved comments found.', $comment_count, 'site-settings-by-avinash' ),
+									$comment_count
+								)
+							);
+							?>
+						</em>
+					</span>
+				</label>
+				<form method="post">
+					<?php wp_nonce_field( self::NONCE_ACTION, self::NONCE_NAME ); ?>
+					<input type="hidden" name="avinash_site_settings_action" value="delete_unapproved_comments">
+					<input type="hidden" name="avinash_site_settings_tab" value="database">
+					<button class="avinash-link-button" type="submit"><?php esc_html_e( 'Remove', 'site-settings-by-avinash' ); ?></button>
+				</form>
+			</div>
+			<div class="avinash-db-task">
+				<label>
+					<input type="checkbox" checked disabled>
+					<span>
+						<strong><?php esc_html_e( 'Remove Expired Transient Options', 'site-settings-by-avinash' ); ?></strong>
+						<em>
+							<?php
+							echo esc_html(
+								sprintf(
+									/* translators: 1: Number of expired transients, 2: Total transient timeout options. */
+									__( '%1$d expired / %2$d total transient option(s).', 'site-settings-by-avinash' ),
+									(int) $transients['expired'],
+									(int) $transients['total']
+								)
+							);
+							?>
+						</em>
+					</span>
+				</label>
+				<form method="post">
+					<?php wp_nonce_field( self::NONCE_ACTION, self::NONCE_NAME ); ?>
+					<input type="hidden" name="avinash_site_settings_action" value="delete_expired_transients">
+					<input type="hidden" name="avinash_site_settings_tab" value="database">
+					<button class="avinash-link-button" type="submit"><?php esc_html_e( 'Remove', 'site-settings-by-avinash' ); ?></button>
+				</form>
+			</div>
+		</section>
+
+		<section class="avinash-panel avinash-db-table-panel">
+			<div class="avinash-panel__header">
+				<div>
+					<h2><?php esc_html_e( 'Database Tables', 'site-settings-by-avinash' ); ?></h2>
+					<p>
+						<?php
+						echo esc_html(
+							sprintf(
+								/* translators: 1: MyISAM table count, 2: InnoDB table count. */
+								__( '%1$d MyISAM table(s), %2$d InnoDB table(s).', 'site-settings-by-avinash' ),
+								$myisam_count,
+								$innodb_count
+							)
+						);
+						?>
+					</p>
+				</div>
+			</div>
+
+			<?php if ( empty( $tables ) ) : ?>
+				<div class="avinash-empty-state">
+					<?php esc_html_e( 'No database table details are available from this database user.', 'site-settings-by-avinash' ); ?>
+				</div>
+			<?php else : ?>
+				<div class="avinash-table-wrap">
+					<table class="avinash-data-table">
+						<thead>
+							<tr>
+								<th><?php esc_html_e( 'Table', 'site-settings-by-avinash' ); ?></th>
+								<th><?php esc_html_e( 'Engine', 'site-settings-by-avinash' ); ?></th>
+								<th><?php esc_html_e( 'Rows', 'site-settings-by-avinash' ); ?></th>
+								<th><?php esc_html_e( 'Data', 'site-settings-by-avinash' ); ?></th>
+								<th><?php esc_html_e( 'Index', 'site-settings-by-avinash' ); ?></th>
+								<th><?php esc_html_e( 'Total Size', 'site-settings-by-avinash' ); ?></th>
+								<th><?php esc_html_e( 'Overhead', 'site-settings-by-avinash' ); ?></th>
+								<th><?php esc_html_e( 'Action', 'site-settings-by-avinash' ); ?></th>
+							</tr>
+						</thead>
+						<tbody>
+							<?php foreach ( $tables as $table ) : ?>
+								<tr>
+									<td><code><?php echo esc_html( $table['name'] ); ?></code></td>
+									<td><span class="avinash-engine-badge avinash-engine-badge--<?php echo esc_attr( strtolower( $table['engine'] ) ); ?>"><?php echo esc_html( $table['engine'] ); ?></span></td>
+									<td><?php echo esc_html( number_format_i18n( (int) $table['rows'] ) ); ?></td>
+									<td><?php echo esc_html( size_format( (int) $table['data_length'], 1 ) ); ?></td>
+									<td><?php echo esc_html( size_format( (int) $table['index_length'], 1 ) ); ?></td>
+									<td><strong><?php echo esc_html( size_format( (int) $table['size'], 1 ) ); ?></strong></td>
+									<td><?php echo esc_html( size_format( (int) $table['overhead'], 1 ) ); ?></td>
+									<td>
+										<form method="post">
+											<?php wp_nonce_field( self::NONCE_ACTION, self::NONCE_NAME ); ?>
+											<input type="hidden" name="avinash_site_settings_action" value="optimize_table">
+											<input type="hidden" name="avinash_site_settings_tab" value="database">
+											<input type="hidden" name="avinash_table_name" value="<?php echo esc_attr( $table['name'] ); ?>">
+											<button class="avinash-link-button" type="submit"><?php esc_html_e( 'Optimize', 'site-settings-by-avinash' ); ?></button>
+										</form>
+									</td>
+								</tr>
+							<?php endforeach; ?>
+						</tbody>
+					</table>
+				</div>
+			<?php endif; ?>
 		</section>
 		<?php
 	}
@@ -593,7 +898,10 @@ final class Avinash_Site_Settings {
 			$options = array();
 		}
 
-		return wp_parse_args( $options, $this->get_defaults() );
+		$options = wp_parse_args( $options, $this->get_defaults() );
+		$options['custom_functions'] = is_array( $options['custom_functions'] ) ? $options['custom_functions'] : array();
+
+		return $options;
 	}
 
 	private function get_defaults(): array {
@@ -614,14 +922,84 @@ final class Avinash_Site_Settings {
 			'smtp_force_from'  => true,
 			'header_scripts'   => '',
 			'footer_scripts'   => '',
-			'custom_functions' => '',
+			'custom_functions' => array(),
 		);
+	}
+
+	private function sanitize_custom_functions( $snippets ): array {
+		if ( ! is_array( $snippets ) ) {
+			return array();
+		}
+
+		$normalized = array();
+
+		foreach ( $snippets as $snippet ) {
+			if ( ! is_array( $snippet ) ) {
+				continue;
+			}
+
+			$title = sanitize_text_field( $snippet['title'] ?? '' );
+			$code  = (string) ( $snippet['code'] ?? '' );
+
+			if ( '' === trim( $title ) && '' === trim( $code ) ) {
+				continue;
+			}
+
+			$normalized[] = array(
+				'title'   => '' !== trim( $title ) ? $title : __( 'Untitled Function', 'site-settings-by-avinash' ),
+				'code'    => $code,
+				'enabled' => ! empty( $snippet['enabled'] ),
+			);
+		}
+
+		return $normalized;
 	}
 
 	private function get_revision_count(): int {
 		global $wpdb;
 
 		return (int) $wpdb->get_var( "SELECT COUNT(ID) FROM {$wpdb->posts} WHERE post_type = 'revision'" );
+	}
+
+	private function get_unapproved_comment_count(): int {
+		global $wpdb;
+
+		return (int) $wpdb->get_var( "SELECT COUNT(comment_ID) FROM {$wpdb->comments} WHERE comment_approved = '0'" );
+	}
+
+	private function get_transient_counts(): array {
+		global $wpdb;
+
+		$total = (int) $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT COUNT(option_id) FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
+				$wpdb->esc_like( '_transient_timeout_' ) . '%',
+				$wpdb->esc_like( '_site_transient_timeout_' ) . '%'
+			)
+		);
+
+		return array(
+			'expired' => count( $this->get_expired_transient_timeout_names() ),
+			'total'   => $total,
+		);
+	}
+
+	private function get_expired_transient_timeout_names(): array {
+		global $wpdb;
+
+		$now = time();
+		$names = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT option_name FROM {$wpdb->options}
+				WHERE (option_name LIKE %s OR option_name LIKE %s)
+				AND option_value < %d",
+				$wpdb->esc_like( '_transient_timeout_' ) . '%',
+				$wpdb->esc_like( '_site_transient_timeout_' ) . '%',
+				$now
+			)
+		);
+
+		return is_array( $names ) ? $names : array();
 	}
 
 	private function get_database_size(): string {
@@ -634,6 +1012,55 @@ final class Avinash_Site_Settings {
 		}
 
 		return size_format( $bytes, 1 );
+	}
+
+	private function get_database_tables(): array {
+		global $wpdb;
+
+		$rows = $wpdb->get_results(
+			'SELECT table_name, engine, table_rows, data_length, index_length, data_free
+			FROM information_schema.TABLES
+			WHERE table_schema = DATABASE()
+			ORDER BY table_name ASC',
+			ARRAY_A
+		);
+
+		if ( ! is_array( $rows ) ) {
+			return array();
+		}
+
+		$tables = array();
+
+		foreach ( $rows as $row ) {
+			$data_length  = max( 0, (int) ( $row['data_length'] ?? 0 ) );
+			$index_length = max( 0, (int) ( $row['index_length'] ?? 0 ) );
+			$overhead     = max( 0, (int) ( $row['data_free'] ?? 0 ) );
+
+			$tables[] = array(
+				'name'         => (string) ( $row['table_name'] ?? '' ),
+				'engine'       => (string) ( $row['engine'] ?? __( 'Unknown', 'site-settings-by-avinash' ) ),
+				'rows'         => max( 0, (int) ( $row['table_rows'] ?? 0 ) ),
+				'data_length'  => $data_length,
+				'index_length' => $index_length,
+				'size'         => $data_length + $index_length,
+				'overhead'     => $overhead,
+			);
+		}
+
+		return $tables;
+	}
+
+	private function database_table_exists( string $table_name ): bool {
+		global $wpdb;
+
+		$found = $wpdb->get_var(
+			$wpdb->prepare(
+				'SELECT table_name FROM information_schema.TABLES WHERE table_schema = DATABASE() AND table_name = %s LIMIT 1',
+				$table_name
+			)
+		);
+
+		return $found === $table_name;
 	}
 
 	private function set_notice( string $message, string $type ): void {
