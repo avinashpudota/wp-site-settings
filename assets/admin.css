@@ -273,6 +273,10 @@
 	grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.avinash-radio-group--stacked {
+	grid-template-columns: 1fr;
+}
+
 .avinash-radio-group label {
 	align-items: center;
 	border: 1px solid var(--ass-border-strong);
@@ -667,6 +671,32 @@
 
 .avinash-db-table-panel {
 	margin-top: 24px;
+}
+
+.avinash-static-actions-panel,
+.avinash-static-files-panel {
+	margin-top: 24px;
+}
+
+.avinash-static-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 12px;
+	padding: 20px;
+}
+
+.avinash-static-actions form {
+	margin: 0;
+}
+
+.avinash-static-files-table {
+	min-width: 760px;
+}
+
+.avinash-static-files-table td:first-child {
+	max-width: 360px;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 
 .avinash-empty-state {

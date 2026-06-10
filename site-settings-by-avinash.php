@@ -13,15 +13,29 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+require_once __DIR__ . '/includes/class-avinash-static-site-cache.php';
+require_once __DIR__ . '/includes/class-avinash-static-site-rewrites.php';
+require_once __DIR__ . '/includes/class-avinash-static-site-generator.php';
+require_once __DIR__ . '/includes/class-avinash-static-site-module.php';
+
 final class Avinash_Site_Settings {
-	private const VERSION       = '1.0.0';
-	private const OPTION_NAME   = 'avinash_site_settings_options';
+	private const VERSION          = '1.0.0';
+	private const OPTION_NAME      = 'avinash_site_settings_options';
 	private const NOTICE_TRANSIENT = 'avinash_site_settings_notice';
-	private const PAGE_SLUG     = 'avinash-site-settings';
-	private const NONCE_ACTION  = 'avinash_site_settings_action';
-	private const NONCE_NAME    = 'avinash_site_settings_nonce';
+	private const UPDATE_TRANSIENT = 'avinash_site_settings_github_update';
+	private const PAGE_SLUG        = 'avinash-site-settings';
+	private const NONCE_ACTION     = 'avinash_site_settings_action';
+	private const NONCE_NAME       = 'avinash_site_settings_nonce';
+	private const GITHUB_OWNER     = 'avinashpudota';
+	private const GITHUB_REPO      = 'wp-site-settings';
+	private const GITHUB_BRANCH    = 'master';
+	private const REQUIRES_WP      = '6.0';
+	private const REQUIRES_PHP     = '7.4';
 
 	private static $instance = null;
+
+	/** @var Avinash_Static_Site_Module */
+	private $static_site;
 
 	public static function instance(): self {
 		if ( null === self::$instance ) {
@@ -32,6 +46,8 @@ final class Avinash_Site_Settings {
 	}
 
 	private function __construct() {
+		$this->static_site = Avinash_Static_Site_Module::instance();
+
 		add_action( 'admin_menu', array( $this, 'register_menu' ) );
 		add_action( 'admin_init', array( $this, 'handle_admin_actions' ) );
 		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_admin_assets' ) );
@@ -40,6 +56,10 @@ final class Avinash_Site_Settings {
 		add_action( 'wp_footer', array( $this, 'print_footer_scripts' ), 99 );
 		add_action( 'plugins_loaded', array( $this, 'load_custom_functions' ), 20 );
 		add_filter( 'plugin_action_links_' . plugin_basename( __FILE__ ), array( $this, 'add_plugin_action_links' ) );
+		add_filter( 'pre_set_site_transient_update_plugins', array( $this, 'check_for_plugin_update' ) );
+		add_filter( 'plugins_api', array( $this, 'get_plugin_update_info' ), 10, 3 );
+		add_filter( 'auto_update_plugin', array( $this, 'enable_automatic_plugin_updates' ), 10, 2 );
+		add_filter( 'upgrader_source_selection', array( $this, 'normalize_github_update_source' ), 10, 4 );
 	}
 
 	public function add_plugin_action_links( array $links ): array {
@@ -52,6 +72,114 @@ final class Avinash_Site_Settings {
 		array_unshift( $links, $settings_link );
 
 		return $links;
+	}
+
+	public function check_for_plugin_update( $transient ) {
+		if ( ! is_object( $transient ) ) {
+			return $transient;
+		}
+
+		$plugin_file = plugin_basename( __FILE__ );
+
+		if ( empty( $transient->checked ) || empty( $transient->checked[ $plugin_file ] ) ) {
+			return $transient;
+		}
+
+		$release = $this->get_github_update_data( $this->should_force_update_check() );
+
+		if ( empty( $release['version'] ) || empty( $release['package'] ) ) {
+			return $transient;
+		}
+
+		if ( ! version_compare( $release['version'], self::VERSION, '>' ) ) {
+			return $transient;
+		}
+
+		if ( empty( $transient->response ) || ! is_array( $transient->response ) ) {
+			$transient->response = array();
+		}
+
+		$transient->response[ $plugin_file ] = (object) array(
+			'id'             => $this->get_github_repository_url(),
+			'slug'           => self::GITHUB_REPO,
+			'plugin'         => $plugin_file,
+			'new_version'    => $release['version'],
+			'url'            => $release['details_url'],
+			'package'        => $release['package'],
+			'requires'       => self::REQUIRES_WP,
+			'requires_php'   => self::REQUIRES_PHP,
+			'tested'         => $release['tested'],
+			'last_updated'   => $release['published_at'],
+			'upgrade_notice' => $release['name'],
+		);
+
+		return $transient;
+	}
+
+	public function get_plugin_update_info( $result, string $action, $args ) {
+		if ( 'plugin_information' !== $action || empty( $args->slug ) || self::GITHUB_REPO !== $args->slug ) {
+			return $result;
+		}
+
+		$release = $this->get_github_update_data( $this->should_force_update_check() );
+
+		if ( empty( $release['version'] ) ) {
+			return $result;
+		}
+
+		return (object) array(
+			'name'          => __( 'Site Settings', 'site-settings-by-avinash' ),
+			'slug'          => self::GITHUB_REPO,
+			'version'       => $release['version'],
+			'author'        => '<a href="https://github.com/' . esc_attr( self::GITHUB_OWNER ) . '">Avinash</a>',
+			'homepage'      => $this->get_github_repository_url(),
+			'download_link' => $release['package'],
+			'requires'      => self::REQUIRES_WP,
+			'requires_php'  => self::REQUIRES_PHP,
+			'tested'        => $release['tested'],
+			'last_updated'  => $release['published_at'],
+			'sections'      => array(
+				'description' => __( 'Lightweight personal utility plugin for SMTP, scripts, custom functions, and database maintenance.', 'site-settings-by-avinash' ),
+				'changelog'   => wp_kses_post( wpautop( $release['body'] ) ),
+			),
+		);
+	}
+
+	public function enable_automatic_plugin_updates( $update, $item ) {
+		if ( isset( $item->plugin ) && plugin_basename( __FILE__ ) === $item->plugin ) {
+			return true;
+		}
+
+		return $update;
+	}
+
+	public function normalize_github_update_source( $source, $remote_source, $upgrader, $hook_extra ) {
+		if ( empty( $hook_extra['plugin'] ) || plugin_basename( __FILE__ ) !== $hook_extra['plugin'] ) {
+			return $source;
+		}
+
+		global $wp_filesystem;
+
+		if ( empty( $wp_filesystem ) || ! $wp_filesystem->is_dir( $source ) ) {
+			return $source;
+		}
+
+		$directory_name = $this->get_installed_plugin_directory_name();
+		$new_source     = trailingslashit( $remote_source ) . $directory_name;
+
+		if ( untrailingslashit( $source ) === untrailingslashit( $new_source ) ) {
+			return $source;
+		}
+
+		if ( $wp_filesystem->exists( $new_source ) ) {
+			$wp_filesystem->delete( $new_source, true );
+		}
+
+		if ( $wp_filesystem->move( $source, $new_source, true ) ) {
+			return trailingslashit( $new_source );
+		}
+
+		return $source;
 	}
 
 	public function register_menu(): void {
@@ -131,6 +259,18 @@ final class Avinash_Site_Settings {
 				$this->optimize_database_table();
 				$tab = 'database';
 				break;
+			case 'static_regenerate':
+				$this->regenerate_static_site();
+				$tab = 'static';
+				break;
+			case 'static_clear_cache':
+				$this->clear_static_site_cache();
+				$tab = 'static';
+				break;
+			case 'static_rebuild_rewrites':
+				$this->rebuild_static_site_rewrites();
+				$tab = 'static';
+				break;
 		}
 
 		wp_safe_redirect(
@@ -175,6 +315,15 @@ final class Avinash_Site_Settings {
 
 		if ( 'functions' === $tab ) {
 			$options['custom_functions'] = $this->sanitize_custom_functions( $posted['custom_functions'] ?? array() );
+		}
+
+		if ( 'static' === $tab ) {
+			$this->static_site->update_settings(
+				array(
+					'enabled'         => ! empty( $posted['static_enabled'] ),
+					'generation_mode' => isset( $posted['static_generation_mode'] ) ? sanitize_key( $posted['static_generation_mode'] ) : 'on_demand',
+				)
+			);
 		}
 
 		update_option( self::OPTION_NAME, $options, false );
@@ -338,6 +487,50 @@ final class Avinash_Site_Settings {
 		);
 	}
 
+	private function regenerate_static_site(): void {
+		if ( $this->static_site->is_enabled() ) {
+			$rewrite_result = $this->static_site->rewrites->install();
+			if ( is_wp_error( $rewrite_result ) ) {
+				$this->set_notice( $rewrite_result->get_error_message(), 'error' );
+				return;
+			}
+		}
+
+		$results = $this->static_site->generator->regenerate_all();
+
+		$message = sprintf(
+			/* translators: 1: Successful pages, 2: Total pages, 3: Failed pages. */
+			__( 'Regenerated %1$d of %2$d static page(s). Failed: %3$d.', 'site-settings-by-avinash' ),
+			(int) $results['success'],
+			(int) $results['total'],
+			(int) $results['failed']
+		);
+
+		if ( ! empty( $results['errors'] ) ) {
+			$message .= ' ' . implode( ' | ', array_slice( $results['errors'], 0, 3 ) );
+		}
+
+		$this->set_notice( $message, empty( $results['failed'] ) ? 'success' : 'error' );
+	}
+
+	private function clear_static_site_cache(): void {
+		$this->static_site->cache->clear();
+		$this->set_notice( __( 'Static cache cleared.', 'site-settings-by-avinash' ), 'success' );
+	}
+
+	private function rebuild_static_site_rewrites(): void {
+		$result = $this->static_site->is_enabled()
+			? $this->static_site->rewrites->install()
+			: $this->static_site->rewrites->remove();
+
+		if ( is_wp_error( $result ) ) {
+			$this->set_notice( $result->get_error_message(), 'error' );
+			return;
+		}
+
+		$this->set_notice( __( 'Static cache rewrite rules rebuilt.', 'site-settings-by-avinash' ), 'success' );
+	}
+
 	public function configure_phpmailer( $phpmailer ): void {
 		$options = $this->get_options();
 
@@ -426,6 +619,8 @@ final class Avinash_Site_Settings {
 		$transients     = 'database' === $active_tab ? $this->get_transient_counts() : array( 'expired' => 0, 'total' => 0 );
 		$db_size        = $this->get_database_size();
 		$db_tables      = 'database' === $active_tab ? $this->get_database_tables() : array();
+		$static_settings = 'static' === $active_tab ? $this->static_site->get_settings() : array();
+		$static_files    = 'static' === $active_tab ? $this->static_site->cache->list_files() : array();
 
 		if ( false !== $notice ) {
 			delete_transient( self::NOTICE_TRANSIENT );
@@ -435,6 +630,7 @@ final class Avinash_Site_Settings {
 			'smtp'      => array( 'label' => __( 'SMTP Config', 'site-settings-by-avinash' ), 'icon' => 'dashicons-email-alt2' ),
 			'scripts'   => array( 'label' => __( 'Header & Footer', 'site-settings-by-avinash' ), 'icon' => 'dashicons-editor-code' ),
 			'functions' => array( 'label' => __( 'Custom Functions', 'site-settings-by-avinash' ), 'icon' => 'dashicons-editor-kitchensink' ),
+			'static'    => array( 'label' => __( 'Static Site', 'site-settings-by-avinash' ), 'icon' => 'dashicons-media-code' ),
 			'database'  => array( 'label' => __( 'DB Optimization', 'site-settings-by-avinash' ), 'icon' => 'dashicons-database' ),
 		);
 		?>
@@ -492,6 +688,8 @@ final class Avinash_Site_Settings {
 							<?php $this->render_scripts_tab( $options ); ?>
 						<?php elseif ( 'functions' === $active_tab ) : ?>
 							<?php $this->render_functions_tab( $options ); ?>
+						<?php elseif ( 'static' === $active_tab ) : ?>
+							<?php $this->render_static_site_tab( $static_settings ); ?>
 						<?php endif; ?>
 					</form>
 
@@ -501,6 +699,10 @@ final class Avinash_Site_Settings {
 
 					<?php if ( 'database' === $active_tab ) : ?>
 						<?php $this->render_database_tab( $revision_count, $comment_count, $transients, $db_size, $db_tables ); ?>
+					<?php endif; ?>
+
+					<?php if ( 'static' === $active_tab ) : ?>
+						<?php $this->render_static_site_actions( $static_files ); ?>
 					<?php endif; ?>
 				</main>
 			</div>
@@ -714,6 +916,164 @@ final class Avinash_Site_Settings {
 		<?php
 	}
 
+	private function render_static_site_tab( array $settings ): void {
+		$settings = wp_parse_args(
+			$settings,
+			array(
+				'enabled'         => 0,
+				'generation_mode' => 'on_demand',
+			)
+		);
+		?>
+		<section class="avinash-panel">
+			<div class="avinash-panel__header">
+				<div>
+					<h2><?php esc_html_e( 'Static Site Generator', 'site-settings-by-avinash' ); ?></h2>
+					<p><?php esc_html_e( 'Serve generated HTML directly from LiteSpeed/Apache while WordPress still handles admin, REST, logged-in visits, and Elementor form submissions.', 'site-settings-by-avinash' ); ?></p>
+				</div>
+				<label class="avinash-switch">
+					<input type="checkbox" name="avinash_site_settings[static_enabled]" value="1" <?php checked( ! empty( $settings['enabled'] ) ); ?>>
+					<span></span>
+					<strong><?php esc_html_e( 'Enabled', 'site-settings-by-avinash' ); ?></strong>
+				</label>
+			</div>
+
+			<div class="avinash-panel__body">
+				<div class="avinash-field-row">
+					<div>
+						<label><?php esc_html_e( 'Generation Mode', 'site-settings-by-avinash' ); ?></label>
+						<p><?php esc_html_e( 'Use on-demand for simple personal sites, or prebuild when you want every page regenerated manually after edits.', 'site-settings-by-avinash' ); ?></p>
+					</div>
+					<div class="avinash-radio-group avinash-radio-group--stacked">
+						<label><input type="radio" name="avinash_site_settings[static_generation_mode]" value="on_demand" <?php checked( $settings['generation_mode'], 'on_demand' ); ?>> <?php esc_html_e( 'Generate on first uncached visit', 'site-settings-by-avinash' ); ?></label>
+						<label><input type="radio" name="avinash_site_settings[static_generation_mode]" value="prebuild" <?php checked( $settings['generation_mode'], 'prebuild' ); ?>> <?php esc_html_e( 'Generate all pages manually or after updates', 'site-settings-by-avinash' ); ?></label>
+					</div>
+				</div>
+
+				<div class="avinash-locked-row">
+					<span class="dashicons dashicons-shield-alt"></span>
+					<strong><?php esc_html_e( 'Static bypasses are always active', 'site-settings-by-avinash' ); ?></strong>
+					<span><?php esc_html_e( 'POST requests, wp-admin, wp-json, search, feeds, previews, query strings, and logged-in users are served by WordPress.', 'site-settings-by-avinash' ); ?></span>
+				</div>
+			</div>
+		</section>
+		<?php
+	}
+
+	private function render_static_site_actions( array $files ): void {
+		?>
+		<section class="avinash-panel avinash-static-actions-panel">
+			<div class="avinash-panel__header">
+				<div>
+					<h2><?php esc_html_e( 'Static Cache Actions', 'site-settings-by-avinash' ); ?></h2>
+					<p>
+						<?php
+						printf(
+							/* translators: %s: Static cache directory path. */
+							esc_html__( 'Cache directory: %s', 'site-settings-by-avinash' ),
+							esc_html( $this->static_site->cache->root() )
+						);
+						?>
+					</p>
+				</div>
+			</div>
+			<div class="avinash-static-actions">
+				<?php $this->render_static_site_action_button( 'static_regenerate', __( 'Regenerate All Pages', 'site-settings-by-avinash' ), 'primary' ); ?>
+				<?php $this->render_static_site_action_button( 'static_clear_cache', __( 'Clear Cache', 'site-settings-by-avinash' ), 'secondary' ); ?>
+				<?php $this->render_static_site_action_button( 'static_rebuild_rewrites', __( 'Rebuild Rewrite Rules', 'site-settings-by-avinash' ), 'secondary' ); ?>
+			</div>
+		</section>
+
+		<section class="avinash-panel avinash-static-files-panel">
+			<div class="avinash-panel__header">
+				<div>
+					<h2><?php esc_html_e( 'Cached Files', 'site-settings-by-avinash' ); ?></h2>
+					<p>
+						<?php
+						echo esc_html(
+							sprintf(
+								/* translators: %d: Number of cached HTML files. */
+								_n( '%d static HTML file found.', '%d static HTML files found.', count( $files ), 'site-settings-by-avinash' ),
+								count( $files )
+							)
+						);
+						?>
+					</p>
+				</div>
+			</div>
+
+			<?php if ( empty( $files ) ) : ?>
+				<div class="avinash-empty-state">
+					<?php esc_html_e( 'No static HTML files have been generated yet.', 'site-settings-by-avinash' ); ?>
+				</div>
+			<?php else : ?>
+				<div class="avinash-table-wrap">
+					<table class="avinash-data-table avinash-static-files-table">
+						<thead>
+							<tr>
+								<th><?php esc_html_e( 'URL', 'site-settings-by-avinash' ); ?></th>
+								<th><?php esc_html_e( 'File', 'site-settings-by-avinash' ); ?></th>
+								<th><?php esc_html_e( 'Age', 'site-settings-by-avinash' ); ?></th>
+								<th><?php esc_html_e( 'Size', 'site-settings-by-avinash' ); ?></th>
+							</tr>
+						</thead>
+						<tbody>
+							<?php foreach ( $files as $file ) : ?>
+								<tr>
+									<td><a href="<?php echo esc_url( $file['url'] ); ?>" target="_blank" rel="noopener noreferrer"><?php echo esc_html( $file['url'] ); ?></a></td>
+									<td><code><?php echo esc_html( $file['relative'] ); ?></code></td>
+									<td><?php echo esc_html( $this->format_static_cache_age( (int) $file['generated_at'] ) ); ?></td>
+									<td><?php echo esc_html( size_format( (int) $file['size'] ) ); ?></td>
+								</tr>
+							<?php endforeach; ?>
+						</tbody>
+					</table>
+				</div>
+			<?php endif; ?>
+		</section>
+		<?php
+	}
+
+	private function render_static_site_action_button( string $action, string $label, string $style ): void {
+		?>
+		<form method="post">
+			<?php wp_nonce_field( self::NONCE_ACTION, self::NONCE_NAME ); ?>
+			<input type="hidden" name="avinash_site_settings_action" value="<?php echo esc_attr( $action ); ?>">
+			<input type="hidden" name="avinash_site_settings_tab" value="static">
+			<button class="avinash-button avinash-button--<?php echo esc_attr( 'primary' === $style ? 'primary' : 'secondary' ); ?>" type="submit"><?php echo esc_html( $label ); ?></button>
+		</form>
+		<?php
+	}
+
+	private function format_static_cache_age( int $timestamp ): string {
+		$age = max( 0, time() - $timestamp );
+
+		if ( $age < HOUR_IN_SECONDS ) {
+			$value = max( 1, (int) floor( $age / MINUTE_IN_SECONDS ) );
+			return sprintf(
+				/* translators: %d: Age in minutes. */
+				_n( '%d minute old', '%d minutes old', $value, 'site-settings-by-avinash' ),
+				$value
+			);
+		}
+
+		if ( $age < DAY_IN_SECONDS ) {
+			$value = max( 1, (int) floor( $age / HOUR_IN_SECONDS ) );
+			return sprintf(
+				/* translators: %d: Age in hours. */
+				_n( '%d hour old', '%d hours old', $value, 'site-settings-by-avinash' ),
+				$value
+			);
+		}
+
+		$value = max( 1, (int) floor( $age / DAY_IN_SECONDS ) );
+		return sprintf(
+			/* translators: %d: Age in days. */
+			_n( '%d day old', '%d days old', $value, 'site-settings-by-avinash' ),
+			$value
+		);
+	}
+
 	private function render_database_tab( int $revision_count, int $comment_count, array $transients, string $db_size, array $tables ): void {
 		$myisam_overhead = 0;
 		$myisam_count    = 0;
@@ -904,6 +1264,238 @@ final class Avinash_Site_Settings {
 		return $options;
 	}
 
+	private function get_github_update_data( bool $force = false ): array {
+		$cached = get_site_transient( self::UPDATE_TRANSIENT );
+
+		if ( ! $force && is_array( $cached ) ) {
+			return $cached;
+		}
+
+		$candidates = array_filter(
+			array(
+				$this->get_latest_github_release(),
+				$this->get_latest_github_tag(),
+				$this->get_github_branch_update(),
+			)
+		);
+
+		$update = array();
+
+		foreach ( $candidates as $candidate ) {
+			if ( empty( $candidate['version'] ) ) {
+				continue;
+			}
+
+			if ( empty( $update ) || version_compare( $candidate['version'], $update['version'], '>' ) ) {
+				$update = $candidate;
+			}
+		}
+
+		$update = wp_parse_args(
+			$update,
+			array(
+				'version'      => '',
+				'name'         => '',
+				'body'         => '',
+				'package'      => '',
+				'details_url'  => $this->get_github_repository_url(),
+				'published_at' => '',
+				'tested'       => '',
+			)
+		);
+
+		set_site_transient( self::UPDATE_TRANSIENT, $update, HOUR_IN_SECONDS );
+
+		return $update;
+	}
+
+	private function get_latest_github_release(): array {
+		$release = $this->github_get_json(
+			sprintf(
+				'https://api.github.com/repos/%1$s/%2$s/releases/latest',
+				rawurlencode( self::GITHUB_OWNER ),
+				rawurlencode( self::GITHUB_REPO )
+			)
+		);
+
+		if ( empty( $release['tag_name'] ) ) {
+			return array();
+		}
+
+		$version = $this->normalize_version( (string) $release['tag_name'] );
+		$body    = ! empty( $release['body'] ) ? (string) $release['body'] : __( 'No changelog was provided for this release.', 'site-settings-by-avinash' );
+
+		return array(
+			'version'      => $version,
+			'name'         => ! empty( $release['name'] ) ? (string) $release['name'] : $release['tag_name'],
+			'body'         => $body,
+			'package'      => $this->get_release_package_url( $release ),
+			'details_url'  => ! empty( $release['html_url'] ) ? (string) $release['html_url'] : $this->get_github_repository_url(),
+			'published_at' => ! empty( $release['published_at'] ) ? (string) $release['published_at'] : '',
+			'tested'       => '',
+		);
+	}
+
+	private function get_latest_github_tag(): array {
+		$tags = $this->github_get_json(
+			sprintf(
+				'https://api.github.com/repos/%1$s/%2$s/tags?per_page=1',
+				rawurlencode( self::GITHUB_OWNER ),
+				rawurlencode( self::GITHUB_REPO )
+			)
+		);
+
+		if ( empty( $tags[0]['name'] ) ) {
+			return array();
+		}
+
+		$tag_name = (string) $tags[0]['name'];
+		$package  = ! empty( $tags[0]['zipball_url'] )
+			? (string) $tags[0]['zipball_url']
+			: sprintf(
+				'https://github.com/%1$s/%2$s/archive/refs/tags/%3$s.zip',
+				rawurlencode( self::GITHUB_OWNER ),
+				rawurlencode( self::GITHUB_REPO ),
+				rawurlencode( $tag_name )
+			);
+
+		return array(
+			'version'      => $this->normalize_version( $tag_name ),
+			'name'         => sprintf(
+				/* translators: %s: GitHub tag name. */
+				__( 'GitHub tag %s', 'site-settings-by-avinash' ),
+				$tag_name
+			),
+			'body'         => __( 'This update was discovered from the latest GitHub tag.', 'site-settings-by-avinash' ),
+			'package'      => $package,
+			'details_url'  => $this->get_github_repository_url() . '/releases/tag/' . rawurlencode( $tag_name ),
+			'published_at' => '',
+			'tested'       => '',
+		);
+	}
+
+	private function get_github_branch_update(): array {
+		$plugin_source = $this->github_get_body(
+			sprintf(
+				'https://raw.githubusercontent.com/%1$s/%2$s/%3$s/%4$s',
+				rawurlencode( self::GITHUB_OWNER ),
+				rawurlencode( self::GITHUB_REPO ),
+				rawurlencode( self::GITHUB_BRANCH ),
+				rawurlencode( basename( __FILE__ ) )
+			)
+		);
+
+		if ( '' === $plugin_source || ! preg_match( '/^[ \t\/*#@]*Version:\s*([^\s]+)/mi', $plugin_source, $matches ) ) {
+			return array();
+		}
+
+		$version = $this->normalize_version( (string) $matches[1] );
+
+		return array(
+			'version'      => $version,
+			'name'         => sprintf(
+				/* translators: %s: GitHub branch name. */
+				__( 'Latest code from %s', 'site-settings-by-avinash' ),
+				self::GITHUB_BRANCH
+			),
+			'body'         => __( 'This update was discovered from the plugin version in the GitHub branch.', 'site-settings-by-avinash' ),
+			'package'      => sprintf(
+				'https://github.com/%1$s/%2$s/archive/refs/heads/%3$s.zip',
+				rawurlencode( self::GITHUB_OWNER ),
+				rawurlencode( self::GITHUB_REPO ),
+				rawurlencode( self::GITHUB_BRANCH )
+			),
+			'details_url'  => $this->get_github_repository_url(),
+			'published_at' => '',
+			'tested'       => '',
+		);
+	}
+
+	private function get_release_package_url( array $release ): string {
+		if ( ! empty( $release['assets'] ) && is_array( $release['assets'] ) ) {
+			foreach ( $release['assets'] as $asset ) {
+				if ( empty( $asset['browser_download_url'] ) || empty( $asset['name'] ) ) {
+					continue;
+				}
+
+				if ( 'zip' === strtolower( pathinfo( (string) $asset['name'], PATHINFO_EXTENSION ) ) ) {
+					return (string) $asset['browser_download_url'];
+				}
+			}
+		}
+
+		return ! empty( $release['zipball_url'] ) ? (string) $release['zipball_url'] : '';
+	}
+
+	private function github_get_json( string $url ): array {
+		$response = wp_remote_get(
+			$url,
+			array(
+				'timeout' => 15,
+				'headers' => $this->get_github_request_headers(),
+			)
+		);
+
+		if ( is_wp_error( $response ) || 200 !== (int) wp_remote_retrieve_response_code( $response ) ) {
+			return array();
+		}
+
+		$decoded = json_decode( wp_remote_retrieve_body( $response ), true );
+
+		return is_array( $decoded ) ? $decoded : array();
+	}
+
+	private function github_get_body( string $url ): string {
+		$response = wp_remote_get(
+			$url,
+			array(
+				'timeout' => 15,
+				'headers' => $this->get_github_request_headers(),
+			)
+		);
+
+		if ( is_wp_error( $response ) || 200 !== (int) wp_remote_retrieve_response_code( $response ) ) {
+			return '';
+		}
+
+		return (string) wp_remote_retrieve_body( $response );
+	}
+
+	private function get_github_request_headers(): array {
+		$headers = array(
+			'Accept'     => 'application/vnd.github+json',
+			'User-Agent' => 'WordPress/' . get_bloginfo( 'version' ) . '; ' . home_url( '/' ),
+		);
+
+		if ( defined( 'AVINASH_SITE_SETTINGS_GITHUB_TOKEN' ) && AVINASH_SITE_SETTINGS_GITHUB_TOKEN ) {
+			$headers['Authorization'] = 'Bearer ' . AVINASH_SITE_SETTINGS_GITHUB_TOKEN;
+		}
+
+		return $headers;
+	}
+
+	private function get_github_repository_url(): string {
+		return sprintf(
+			'https://github.com/%1$s/%2$s',
+			rawurlencode( self::GITHUB_OWNER ),
+			rawurlencode( self::GITHUB_REPO )
+		);
+	}
+
+	private function normalize_version( string $version ): string {
+		return ltrim( trim( $version ), 'vV' );
+	}
+
+	private function should_force_update_check(): bool {
+		return is_admin() && isset( $_GET['force-check'] ) && '1' === (string) wp_unslash( $_GET['force-check'] );
+	}
+
+	private function get_installed_plugin_directory_name(): string {
+		$directory = dirname( plugin_basename( __FILE__ ) );
+
+		return '.' !== $directory ? $directory : self::GITHUB_REPO;
+	}
+
 	private function get_defaults(): array {
 		$domain = wp_parse_url( home_url(), PHP_URL_HOST );
 		$domain = $domain ? preg_replace( '/^www\./i', '', $domain ) : 'domainname.tld';
@@ -1075,7 +1667,7 @@ final class Avinash_Site_Settings {
 	}
 
 	private function normalize_tab( string $tab ): string {
-		return in_array( $tab, array( 'smtp', 'scripts', 'functions', 'database' ), true ) ? $tab : 'smtp';
+		return in_array( $tab, array( 'smtp', 'scripts', 'functions', 'static', 'database' ), true ) ? $tab : 'smtp';
 	}
 
 	private function normalize_encryption( string $encryption ): string {
@@ -1089,5 +1681,8 @@ final class Avinash_Site_Settings {
 		return (string) $code;
 	}
 }
+
+register_activation_hook( __FILE__, array( 'Avinash_Static_Site_Module', 'activate' ) );
+register_deactivation_hook( __FILE__, array( 'Avinash_Static_Site_Module', 'deactivate' ) );
 
 Avinash_Site_Settings::instance();
