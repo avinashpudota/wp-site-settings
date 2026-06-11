@@ -155,7 +155,7 @@ class Avinash_Static_Site_Module {
 	public function maybe_start_capture(): void {
 		$is_build_request = $this->is_valid_build_request();
 
-		if ( ! $is_build_request && ( ! $this->is_enabled() || 'on_demand' !== $this->generation_mode() ) ) {
+		if ( ! $is_build_request && ! $this->is_enabled() ) {
 			return;
 		}
 
@@ -164,6 +164,23 @@ class Avinash_Static_Site_Module {
 		}
 
 		$this->capture_url = $this->current_public_url();
+
+		if ( ! $is_build_request ) {
+			$file = $this->cache->path_for_url( $this->capture_url );
+			if ( file_exists( $file ) ) {
+				$html = file_get_contents( $file );
+				if ( false !== $html ) {
+					header( 'X-Avinash-Static-Cache: HIT' );
+					echo $html; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+					exit;
+				}
+			}
+		}
+
+		if ( ! $is_build_request && 'on_demand' !== $this->generation_mode() ) {
+			return;
+		}
+
 		ob_start( array( $this, 'capture_html' ) );
 	}
 
