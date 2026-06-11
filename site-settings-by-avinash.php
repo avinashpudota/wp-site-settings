@@ -19,7 +19,7 @@ require_once __DIR__ . '/includes/class-avinash-static-site-generator.php';
 require_once __DIR__ . '/includes/class-avinash-static-site-module.php';
 
 final class Avinash_Site_Settings {
-	private const VERSION          = '1.0.0';
+	private const VERSION          = '1.1.0';
 	private const OPTION_NAME      = 'avinash_site_settings_options';
 	private const NOTICE_TRANSIENT = 'avinash_site_settings_notice';
 	private const UPDATE_TRANSIENT = 'avinash_site_settings_github_update';
