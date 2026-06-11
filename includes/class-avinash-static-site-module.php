@@ -170,7 +170,7 @@ class Avinash_Static_Site_Module {
 			if ( file_exists( $file ) ) {
 				$html = file_get_contents( $file );
 				if ( false !== $html ) {
-					header( 'X-Avinash-Static-Cache: HIT' );
+					header( 'X-Avinash-Static-Cache: PHP-HIT' );
 					echo $html; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 					exit;
 				}
