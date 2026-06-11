@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Site Settings
  * Description: Lightweight personal utility plugin for SMTP, scripts, custom functions, and database maintenance.
- * Version: 1.0.0
+ * Version: 1.1.0
  * Author: Avinash
  * Requires at least: 6.0
  * Requires PHP: 7.4
