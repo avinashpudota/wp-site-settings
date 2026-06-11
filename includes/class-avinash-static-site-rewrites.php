@@ -22,7 +22,29 @@ class Avinash_Static_Site_Rewrites {
 			require_once ABSPATH . 'wp-admin/includes/misc.php';
 		}
 
-		$result = insert_with_markers( $file, self::MARKER, $this->rules() );
+		$exists = false;
+		if ( file_exists( $file ) ) {
+			$content = file_get_contents( $file );
+			if ( false !== $content && false !== strpos( $content, '# BEGIN ' . self::MARKER ) ) {
+				$exists = true;
+			}
+		}
+
+		if ( ! $exists ) {
+			$rules = $this->rules();
+			$block = array();
+			$block[] = '# BEGIN ' . self::MARKER;
+			foreach ( $rules as $rule ) {
+				$block[] = $rule;
+			}
+			$block[] = '# END ' . self::MARKER;
+			$block_str = implode( "\n", $block ) . "\n\n";
+
+			$existing_content = file_exists( $file ) ? file_get_contents( $file ) : '';
+			$result = file_put_contents( $file, $block_str . $existing_content );
+		} else {
+			$result = insert_with_markers( $file, self::MARKER, $this->rules() );
+		}
 
 		return $result ? true : new WP_Error( 'avinash_static_rewrite_failed', __( 'Could not write static cache rules to .htaccess.', 'site-settings-by-avinash' ) );
 	}
