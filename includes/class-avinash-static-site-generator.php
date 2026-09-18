@@ -47,15 +47,24 @@ class Avinash_Static_Site_Generator {
 	}
 
 	public function generate_url( string $url ) {
+		$target = wp_parse_url( $url );
+		$home = wp_parse_url( home_url( '/' ) );
+		if ( ! is_array( $target ) || ! is_array( $home ) || isset( $target['user'] ) || isset( $target['pass'] )
+			|| ( $target['scheme'] ?? '' ) !== ( $home['scheme'] ?? '' )
+			|| ( $target['host'] ?? '' ) !== ( $home['host'] ?? '' )
+			|| ( $target['port'] ?? null ) !== ( $home['port'] ?? null ) ) {
+			return new WP_Error( 'avinash_static_invalid_origin', __( 'Only URLs on this site can be generated.', 'site-settings-by-avinash' ) );
+		}
 		$token = get_option( Avinash_Static_Site_Module::BUILD_TOKEN_OPTION );
 		$url   = remove_query_arg( array( 'avinash_static_build', 'pssc_build' ), $url );
 		$build = add_query_arg( 'avinash_static_build', rawurlencode( (string) $token ), $url );
 
-		$response = wp_remote_get(
+		$this->cache->delete_url( $url );
+		$response = wp_safe_remote_get(
 			$build,
 			array(
 				'timeout'     => 30,
-				'redirection' => 5,
+				'redirection' => 0,
 				'headers'     => array(
 					'X-Avinash-Static-Build' => '1',
 				),
@@ -83,9 +92,13 @@ class Avinash_Static_Site_Generator {
 			return new WP_Error( 'avinash_static_not_html', __( 'Response did not look like HTML.', 'site-settings-by-avinash' ) );
 		}
 
-		$body = Avinash_Static_Site_Module::instance()->prepare_html_for_static_cache( $body );
-
-		return $this->cache->write( $url, $body );
+		// The loopback capture enforces privacy/cookie/cache-control checks. Never
+		// write the response here: doing so would bypass those checks.
+		$file = $this->cache->path_for_url( $url );
+		if ( ! is_file( $file ) ) {
+			return new WP_Error( 'avinash_static_not_cacheable', __( 'Page was not cacheable or the cache could not be written.', 'site-settings-by-avinash' ) );
+		}
+		return $file;
 	}
 
 	public function get_urls(): array {
@@ -112,7 +125,8 @@ class Avinash_Static_Site_Generator {
 			}
 		}
 
-		$urls = array_values( array_unique( array_map( 'untrailingslashit', $urls ) ) );
+		// Keep canonical trailing slashes: builds intentionally do not follow redirects.
+		$urls = array_values( array_unique( $urls ) );
 		$urls = apply_filters( 'pssc_static_urls', $urls );
 
 		return apply_filters( 'avinash_static_site_urls', $urls );

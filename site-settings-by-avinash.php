@@ -2,8 +2,9 @@
 /**
  * Plugin Name: Site Settings
  * Description: Lightweight personal utility plugin for SMTP, scripts, custom functions, and database maintenance.
- * Version: 1.1.0
+ * Version: 1.2.0
  * Author: Avinash
+ * Update URI: https://github.com/avinashpudota/wp-site-settings
  * Requires at least: 6.0
  * Requires PHP: 7.4
  * Text Domain: site-settings-by-avinash
@@ -17,9 +18,10 @@ require_once __DIR__ . '/includes/class-avinash-static-site-cache.php';
 require_once __DIR__ . '/includes/class-avinash-static-site-rewrites.php';
 require_once __DIR__ . '/includes/class-avinash-static-site-generator.php';
 require_once __DIR__ . '/includes/class-avinash-static-site-module.php';
+require_once __DIR__ . '/includes/class-avinash-live-checklist.php';
 
 final class Avinash_Site_Settings {
-	private const VERSION          = '1.1.0';
+	private const VERSION          = '1.2.0';
 	private const OPTION_NAME      = 'avinash_site_settings_options';
 	private const NOTICE_TRANSIENT = 'avinash_site_settings_notice';
 	private const UPDATE_TRANSIENT = 'avinash_site_settings_github_update';
@@ -47,6 +49,7 @@ final class Avinash_Site_Settings {
 
 	private function __construct() {
 		$this->static_site = Avinash_Static_Site_Module::instance();
+		new Avinash_Live_Checklist( array( $this, 'is_smtp_ready' ) );
 
 		add_action( 'admin_menu', array( $this, 'register_menu' ) );
 		add_action( 'admin_init', array( $this, 'handle_admin_actions' ) );
@@ -58,7 +61,6 @@ final class Avinash_Site_Settings {
 		add_filter( 'plugin_action_links_' . plugin_basename( __FILE__ ), array( $this, 'add_plugin_action_links' ) );
 		add_filter( 'pre_set_site_transient_update_plugins', array( $this, 'check_for_plugin_update' ) );
 		add_filter( 'plugins_api', array( $this, 'get_plugin_update_info' ), 10, 3 );
-		add_filter( 'auto_update_plugin', array( $this, 'enable_automatic_plugin_updates' ), 10, 2 );
 		add_filter( 'upgrader_source_selection', array( $this, 'normalize_github_update_source' ), 10, 4 );
 	}
 
@@ -87,11 +89,20 @@ final class Avinash_Site_Settings {
 
 		$release = $this->get_github_update_data( $this->should_force_update_check() );
 
-		if ( empty( $release['version'] ) || empty( $release['package'] ) ) {
-			return $transient;
-		}
-
-		if ( ! version_compare( $release['version'], self::VERSION, '>' ) ) {
+		if ( empty( $release['version'] ) || empty( $release['package'] ) || ! version_compare( $release['version'], self::VERSION, '>' ) ) {
+			// WordPress needs a no_update entry to expose its auto-update toggle
+			// for plugins hosted outside the WordPress.org directory.
+			if ( empty( $transient->no_update ) || ! is_array( $transient->no_update ) ) {
+				$transient->no_update = array();
+			}
+			$transient->no_update[ $plugin_file ] = (object) array(
+				'id'          => $this->get_github_repository_url(),
+				'slug'        => self::GITHUB_REPO,
+				'plugin'      => $plugin_file,
+				'new_version' => self::VERSION,
+				'url'         => $this->get_github_repository_url(),
+				'package'     => '',
+			);
 			return $transient;
 		}
 
@@ -99,6 +110,7 @@ final class Avinash_Site_Settings {
 			$transient->response = array();
 		}
 
+		unset( $transient->no_update[ $plugin_file ] );
 		$transient->response[ $plugin_file ] = (object) array(
 			'id'             => $this->get_github_repository_url(),
 			'slug'           => self::GITHUB_REPO,
@@ -143,14 +155,6 @@ final class Avinash_Site_Settings {
 				'changelog'   => wp_kses_post( wpautop( $release['body'] ) ),
 			),
 		);
-	}
-
-	public function enable_automatic_plugin_updates( $update, $item ) {
-		if ( isset( $item->plugin ) && plugin_basename( __FILE__ ) === $item->plugin ) {
-			return true;
-		}
-
-		return $update;
 	}
 
 	public function normalize_github_update_source( $source, $remote_source, $upgrader, $hook_extra ) {
@@ -286,6 +290,9 @@ final class Avinash_Site_Settings {
 	}
 
 	private function save_settings( string $tab ): void {
+		if ( ( 'functions' === $tab && ! current_user_can( 'edit_plugins' ) ) || ( 'scripts' === $tab && ! current_user_can( 'unfiltered_html' ) ) ) {
+			wp_die( esc_html__( 'You do not have permission to edit this code.', 'site-settings-by-avinash' ), '', array( 'response' => 403 ) );
+		}
 		$current = $this->get_options();
 		$posted  = isset( $_POST['avinash_site_settings'] ) && is_array( $_POST['avinash_site_settings'] )
 			? wp_unslash( $_POST['avinash_site_settings'] )
@@ -296,13 +303,16 @@ final class Avinash_Site_Settings {
 		if ( 'smtp' === $tab ) {
 			$options['smtp_enabled']    = ! empty( $posted['smtp_enabled'] );
 			$options['smtp_host']       = sanitize_text_field( $posted['smtp_host'] ?? $current['smtp_host'] );
-			$options['smtp_port']       = max( 1, absint( $posted['smtp_port'] ?? $current['smtp_port'] ) );
+			$options['smtp_port']       = min( 65535, max( 1, absint( $posted['smtp_port'] ?? $current['smtp_port'] ) ) );
 			$options['smtp_encryption'] = $this->normalize_encryption( $posted['smtp_encryption'] ?? $current['smtp_encryption'] );
 			$options['smtp_auth']       = true;
 			$options['smtp_username']   = sanitize_text_field( $posted['smtp_username'] ?? $current['smtp_username'] );
 			$options['smtp_password']   = '' !== (string) ( $posted['smtp_password'] ?? '' )
 				? (string) $posted['smtp_password']
 				: (string) $current['smtp_password'];
+			if ( ! empty( $posted['smtp_clear_password'] ) ) {
+				$options['smtp_password'] = '';
+			}
 			$options['smtp_from_email'] = sanitize_email( $posted['smtp_from_email'] ?? $current['smtp_from_email'] );
 			$options['smtp_from_name']  = sanitize_text_field( $posted['smtp_from_name'] ?? $current['smtp_from_name'] );
 			$options['smtp_force_from'] = true;
@@ -330,7 +340,6 @@ final class Avinash_Site_Settings {
 	}
 
 	private function send_test_email(): void {
-		$options = $this->get_options();
 		$to = isset( $_POST['avinash_test_email'] ) ? sanitize_email( wp_unslash( $_POST['avinash_test_email'] ) ) : '';
 
 		if ( ! is_email( $to ) ) {
@@ -338,8 +347,8 @@ final class Avinash_Site_Settings {
 			return;
 		}
 
-		if ( empty( $options['smtp_password'] ) ) {
-			$this->set_notice( __( 'Save your SMTP password before sending a test email.', 'site-settings-by-avinash' ), 'error' );
+		if ( ! $this->is_smtp_ready() ) {
+			$this->set_notice( __( 'Enable SMTP and save all configuration fields, including the password, before sending a test email.', 'site-settings-by-avinash' ), 'error' );
 			return;
 		}
 
@@ -460,6 +469,9 @@ final class Avinash_Site_Settings {
 	}
 
 	private function optimize_database_table(): void {
+		if ( is_multisite() && ! current_user_can( 'manage_network_options' ) ) {
+			wp_die( esc_html__( 'Only network administrators can optimize shared database tables.', 'site-settings-by-avinash' ), '', array( 'response' => 403 ) );
+		}
 		global $wpdb;
 
 		$table_name = isset( $_POST['avinash_table_name'] ) ? sanitize_text_field( wp_unslash( $_POST['avinash_table_name'] ) ) : '';
@@ -531,16 +543,24 @@ final class Avinash_Site_Settings {
 		$this->set_notice( __( 'Static cache rewrite rules rebuilt.', 'site-settings-by-avinash' ), 'success' );
 	}
 
-	public function configure_phpmailer( $phpmailer ): void {
+	public function is_smtp_ready(): bool {
 		$options = $this->get_options();
+		foreach ( array( 'smtp_host', 'smtp_username', 'smtp_password', 'smtp_from_email', 'smtp_from_name' ) as $field ) {
+			if ( ! is_string( $options[ $field ] ) || '' === trim( $options[ $field ] ) ) {
+				return false;
+			}
+		}
+		return ! empty( $options['smtp_enabled'] )
+			&& false !== filter_var( $options['smtp_port'], FILTER_VALIDATE_INT, array( 'options' => array( 'min_range' => 1, 'max_range' => 65535 ) ) )
+			&& in_array( $options['smtp_encryption'], array( 'tls', 'ssl', 'none' ), true )
+			&& (bool) is_email( $options['smtp_from_email'] );
+	}
 
-		if ( empty( $options['smtp_enabled'] ) ) {
+	public function configure_phpmailer( $phpmailer ): void {
+		if ( ! $this->is_smtp_ready() ) {
 			return;
 		}
-
-		if ( empty( $options['smtp_password'] ) || ! is_email( $options['smtp_username'] ) ) {
-			return;
-		}
+		$options = $this->get_options();
 
 		$phpmailer->isSMTP();
 		$phpmailer->Host       = $options['smtp_host'];
@@ -576,6 +596,10 @@ final class Avinash_Site_Settings {
 	}
 
 	public function load_custom_functions(): void {
+		// Recovery switch works even if a saved snippet prevents wp-admin loading.
+		if ( defined( 'AVINASH_SITE_SETTINGS_DISABLE_CUSTOM_FUNCTIONS' ) && AVINASH_SITE_SETTINGS_DISABLE_CUSTOM_FUNCTIONS ) {
+			return;
+		}
 		$options = $this->get_options();
 		$snippets = $options['custom_functions'];
 		$errors   = array();
@@ -751,7 +775,7 @@ final class Avinash_Site_Settings {
 						<label for="avinash-smtp-port"><?php esc_html_e( 'Port', 'site-settings-by-avinash' ); ?></label>
 						<p><?php esc_html_e( 'Use 587 for TLS, 465 for SSL, or your provider value.', 'site-settings-by-avinash' ); ?></p>
 					</div>
-					<input id="avinash-smtp-port" class="avinash-input--short" name="avinash_site_settings[smtp_port]" type="number" min="1" value="<?php echo esc_attr( $options['smtp_port'] ); ?>" required>
+					<input id="avinash-smtp-port" class="avinash-input--short" name="avinash_site_settings[smtp_port]" type="number" min="1" max="65535" value="<?php echo esc_attr( $options['smtp_port'] ); ?>" required>
 				</div>
 
 				<div class="avinash-field-row">
@@ -759,7 +783,7 @@ final class Avinash_Site_Settings {
 						<label for="avinash-smtp-username"><?php esc_html_e( 'Email / Username', 'site-settings-by-avinash' ); ?></label>
 						<p><?php esc_html_e( 'Pre-filled as noreply@domainname.tld.', 'site-settings-by-avinash' ); ?></p>
 					</div>
-					<input id="avinash-smtp-username" name="avinash_site_settings[smtp_username]" type="email" value="<?php echo esc_attr( $options['smtp_username'] ); ?>" required>
+					<input id="avinash-smtp-username" name="avinash_site_settings[smtp_username]" type="text" value="<?php echo esc_attr( $options['smtp_username'] ); ?>" required>
 				</div>
 
 				<div class="avinash-field-row">
@@ -767,7 +791,10 @@ final class Avinash_Site_Settings {
 						<label for="avinash-smtp-password"><?php esc_html_e( 'Password', 'site-settings-by-avinash' ); ?></label>
 						<p><?php esc_html_e( 'Leave blank to keep the saved password.', 'site-settings-by-avinash' ); ?></p>
 					</div>
-					<input id="avinash-smtp-password" name="avinash_site_settings[smtp_password]" type="password" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( $options['smtp_password'] ? __( 'Saved password will be kept', 'site-settings-by-avinash' ) : __( 'Enter mailbox password', 'site-settings-by-avinash' ) ); ?>">
+					<div>
+						<input id="avinash-smtp-password" name="avinash_site_settings[smtp_password]" type="password" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( $options['smtp_password'] ? __( 'Saved password will be kept', 'site-settings-by-avinash' ) : __( 'Enter mailbox password', 'site-settings-by-avinash' ) ); ?>">
+						<p><label><input type="checkbox" name="avinash_site_settings[smtp_clear_password]" value="1"> <?php esc_html_e( 'Remove saved password', 'site-settings-by-avinash' ); ?></label></p>
+					</div>
 				</div>
 
 				<div class="avinash-field-row">
@@ -783,7 +810,7 @@ final class Avinash_Site_Settings {
 						<label for="avinash-from-name"><?php esc_html_e( 'From Name', 'site-settings-by-avinash' ); ?></label>
 						<p><?php esc_html_e( 'Shown as the sender name in email clients.', 'site-settings-by-avinash' ); ?></p>
 					</div>
-					<input id="avinash-from-name" name="avinash_site_settings[smtp_from_name]" type="text" value="<?php echo esc_attr( $options['smtp_from_name'] ); ?>">
+					<input id="avinash-from-name" name="avinash_site_settings[smtp_from_name]" type="text" value="<?php echo esc_attr( $options['smtp_from_name'] ); ?>" required>
 				</div>
 
 				<div class="avinash-locked-row">
@@ -823,6 +850,10 @@ final class Avinash_Site_Settings {
 	}
 
 	private function render_scripts_tab( array $options ): void {
+		if ( ! current_user_can( 'unfiltered_html' ) ) {
+			echo '<p>' . esc_html__( 'You do not have permission to edit scripts.', 'site-settings-by-avinash' ) . '</p>';
+			return;
+		}
 		?>
 		<section class="avinash-panel">
 			<div class="avinash-panel__header">
@@ -845,6 +876,10 @@ final class Avinash_Site_Settings {
 	}
 
 	private function render_functions_tab( array $options ): void {
+		if ( ! current_user_can( 'edit_plugins' ) ) {
+			echo '<p>' . esc_html__( 'Code editing is disabled for your account or by WordPress configuration.', 'site-settings-by-avinash' ) . '</p>';
+			return;
+		}
 		$snippets = $options['custom_functions'];
 
 		if ( empty( $snippets ) ) {
@@ -1595,6 +1630,9 @@ final class Avinash_Site_Settings {
 	}
 
 	private function get_database_size(): string {
+		if ( is_multisite() && ! current_user_can( 'manage_network_options' ) ) {
+			return __( 'Network administrator access required', 'site-settings-by-avinash' );
+		}
 		global $wpdb;
 
 		$bytes = (float) $wpdb->get_var( 'SELECT SUM(data_length + index_length) FROM information_schema.TABLES WHERE table_schema = DATABASE()' );
@@ -1607,6 +1645,9 @@ final class Avinash_Site_Settings {
 	}
 
 	private function get_database_tables(): array {
+		if ( is_multisite() && ! current_user_can( 'manage_network_options' ) ) {
+			return array();
+		}
 		global $wpdb;
 
 		$rows = $wpdb->get_results(

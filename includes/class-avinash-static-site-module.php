@@ -16,6 +16,7 @@ class Avinash_Static_Site_Module {
 	const LEGACY_SETTINGS_OPTION    = 'pssc_settings';
 	const LEGACY_CACHE_INDEX_OPTION = 'pssc_cache_index';
 	const LEGACY_BUILD_TOKEN_OPTION = 'pssc_build_token';
+	const SECURITY_VERSION_OPTION   = 'avinash_static_cache_security_version';
 
 	private static $instance = null;
 
@@ -101,7 +102,8 @@ class Avinash_Static_Site_Module {
 		add_action( 'wp_ajax_nopriv_pssc_elementor_nonce', array( $this, 'send_elementor_nonce' ) );
 
 		add_action( 'save_post', array( $this, 'handle_post_save' ), 20, 3 );
-		add_action( 'deleted_post', array( $this, 'handle_post_deleted' ) );
+		add_action( 'before_delete_post', array( $this, 'handle_post_deleted' ) );
+		add_action( 'admin_init', array( $this, 'upgrade_cache_security' ) );
 		add_action( 'wp_update_nav_menu', array( $this, 'handle_global_change' ) );
 		add_action( 'customize_save_after', array( $this, 'handle_global_change' ) );
 		add_action( 'switch_theme', array( $this, 'handle_global_change' ) );
@@ -118,6 +120,18 @@ class Avinash_Static_Site_Module {
 		);
 
 		return wp_parse_args( get_option( self::SETTINGS_OPTION, array() ), $defaults );
+	}
+
+	public function upgrade_cache_security(): void {
+		if ( ! current_user_can( 'manage_options' ) || '1.2.0' === get_option( self::SECURITY_VERSION_OPTION ) ) {
+			return;
+		}
+		// Previously generated files may contain password-protected content.
+		$this->cache->clear();
+		$result = $this->is_enabled() ? $this->rewrites->install() : $this->rewrites->remove();
+		if ( ! is_wp_error( $result ) ) {
+			update_option( self::SECURITY_VERSION_OPTION, '1.2.0', false );
+		}
 	}
 
 	public function update_settings( array $settings ): void {
@@ -190,8 +204,13 @@ class Avinash_Static_Site_Module {
 		}
 
 		$status = function_exists( 'http_response_code' ) ? http_response_code() : 200;
-		if ( $status >= 400 || false === stripos( $html, '<html' ) ) {
+		if ( 200 !== $status || false === stripos( $html, '<html' ) || ( defined( 'DONOTCACHEPAGE' ) && DONOTCACHEPAGE ) ) {
 			return $html;
+		}
+		foreach ( headers_list() as $header ) {
+			if ( preg_match( '/^(Set-Cookie:|Cache-Control:.*(?:private|no-store|no-cache))/i', $header ) ) {
+				return $html;
+			}
 		}
 
 		$html = $this->prepare_html_for_static_cache( $html );
@@ -231,7 +250,9 @@ class Avinash_Static_Site_Module {
 			return;
 		}
 
-		if ( ! $this->is_enabled() || ! $post || 'publish' !== $post->post_status ) {
+		// Clear old permalinks and archive copies even when changing to private/draft.
+		$this->cache->clear();
+		if ( ! $this->is_enabled() || ! $post || 'publish' !== $post->post_status || ! empty( $post->post_password ) ) {
 			return;
 		}
 
@@ -243,10 +264,7 @@ class Avinash_Static_Site_Module {
 	}
 
 	public function handle_post_deleted( int $post_id ): void {
-		$permalink = get_permalink( $post_id );
-		if ( $permalink ) {
-			$this->cache->delete_url( $permalink );
-		}
+		$this->cache->clear();
 	}
 
 	public function handle_global_change(): void {
@@ -259,7 +277,8 @@ class Avinash_Static_Site_Module {
 	}
 
 	public function regenerate_post_event( int $post_id ): void {
-		if ( ! $this->is_enabled() ) {
+		$post = get_post( $post_id );
+		if ( ! $this->is_enabled() || ! $post || 'publish' !== $post->post_status || ! empty( $post->post_password ) ) {
 			return;
 		}
 
@@ -322,6 +341,10 @@ class Avinash_Static_Site_Module {
 	}
 
 	private function is_cacheable_request( bool $is_build_request ): bool {
+		// Cookie/session content must never enter the shared public cache.
+		if ( ! empty( $_COOKIE ) || ( defined( 'DONOTCACHEPAGE' ) && DONOTCACHEPAGE ) ) {
+			return false;
+		}
 		if ( is_admin() || ( function_exists( 'wp_doing_ajax' ) && wp_doing_ajax() ) ) {
 			return false;
 		}
@@ -337,9 +360,22 @@ class Avinash_Static_Site_Module {
 		if ( is_user_logged_in() || is_preview() || is_404() || is_search() || is_feed() || is_trackback() ) {
 			return false;
 		}
+		if ( is_singular() ) {
+			$post = get_queried_object();
+			if ( ! $post instanceof WP_Post || 'publish' !== $post->post_status || ! empty( $post->post_password ) ) {
+				return false;
+			}
+		}
+		foreach ( array( 'is_cart', 'is_checkout', 'is_account_page' ) as $conditional ) {
+			if ( function_exists( $conditional ) && $conditional() ) {
+				return false;
+			}
+		}
 
 		$query = $_GET;
-		unset( $query['avinash_static_build'], $query['pssc_build'] );
+		if ( $is_build_request ) {
+			unset( $query['avinash_static_build'], $query['pssc_build'] );
+		}
 		if ( ! empty( $query ) ) {
 			return false;
 		}

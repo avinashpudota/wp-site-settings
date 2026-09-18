@@ -48,9 +48,17 @@ class Avinash_Static_Site_Cache {
 			wp_mkdir_p( $dir );
 		}
 
-		$tmp = $file . '.tmp';
-		file_put_contents( $tmp, $html, LOCK_EX );
-		rename( $tmp, $file );
+		$tmp = tempnam( $dir, 'avinash-' );
+		if ( false === $tmp ) {
+			return new WP_Error( 'avinash_static_write_failed', __( 'Could not create a cache file.', 'site-settings-by-avinash' ) );
+		}
+		$written = file_put_contents( $tmp, $html, LOCK_EX );
+		// tempnam creates mode 0600; static web servers may use a separate user.
+		chmod( $tmp, defined( 'FS_CHMOD_FILE' ) ? FS_CHMOD_FILE : 0644 );
+		if ( strlen( $html ) !== $written || ! rename( $tmp, $file ) ) {
+			@unlink( $tmp );
+			return new WP_Error( 'avinash_static_write_failed', __( 'Could not write the cache file.', 'site-settings-by-avinash' ) );
+		}
 
 		$this->remember_file( $url, $file );
 
